@@ -42,5 +42,10 @@ void lcd_send_string(char *str){
 		lcd_send_data(*str++);
 	}
 }
+void lcd_clear(void){
+    lcd_send_command(0x01);
+    HAL_Delay(2);
+}
+
 
 // trong hàm while khỏi tạo lcd_init() nx nghe
