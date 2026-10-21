@@ -43,7 +43,7 @@ void lcd_send_string(char *str){
 	}
 }
 void lcd_clear(void){
-    lcd_send_command(0x01);
+    lcd_send_command(0x01);// clear
     HAL_Delay(2);
 }
 
