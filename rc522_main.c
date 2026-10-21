@@ -52,7 +52,8 @@ TIM_HandleTypeDef htim2;
 uint8_t status;
 uint8_t str[MAX_LEN]; // Max_LEN = 16
 uint8_t sNum[5];
-
+uint8_t da_xu_ly_the = 0;
+uint32_t thoi_diem_mat_the = 0;
 
 
 /* USER CODE END PV */
@@ -115,7 +116,12 @@ int main(void)
   MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
 
+HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+Servo(0);
 MFRC522_Init();
+lcd_init();
+lcd_clear();
+lcd_send_string("Vui long dua the");
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -124,42 +130,86 @@ MFRC522_Init();
 
 while (1)
 {
-    status = MFRC522_Request(PICC_REQIDL, str);
+    // Phat hien the dang o gan RC522, ke ca the dang HALT
+    status = MFRC522_Request(PICC_REQALL, str);
 
     if (status == MI_OK)
     {
+        // Van con nhin thay the: huy bo dem mat the
+        thoi_diem_mat_the = 0;
+
         status = MFRC522_Anticoll(str);
 
         if (status == MI_OK)
         {
             memcpy(sNum, str, 5);
 
-            if ((str[0] == 215) &&
-                (str[1] == 116) &&
-                (str[2] == 219) &&
-                (str[3] == 149) &&
-                (str[4] == 237))
+            // Chi xu ly mot lan cho moi lan dua the vao
+            if (da_xu_ly_the == 0)
             {
-                HAL_GPIO_WritePin(GPIOA, GPIO_PIN_3, GPIO_PIN_SET);
-							  Servo(130);
-                HAL_Delay(1000);
-							Servo(0);
-                HAL_GPIO_WritePin(GPIOA, GPIO_PIN_3, GPIO_PIN_RESET);
+                da_xu_ly_the = 1;
+
+                // UID the hop le
+                if (sNum[0] == 215 &&
+                    sNum[1] == 116 &&
+                    sNum[2] == 219 &&
+                    sNum[3] == 149 &&
+                    sNum[4] == 237)
+                {
+                    // Bat LED
+                    HAL_GPIO_WritePin(
+                        GPIOA, GPIO_PIN_3, GPIO_PIN_SET
+                    );
+
+                    // Mo cua
+									lcd_clear();
+									HAL_Delay(300);
+									lcd_send_string(" the chinh xac");
+                    Servo(130);
+
+                    // Giu cua mo 3 giay
+                    HAL_Delay(4000);
+
+                    // Dong cua
+                    Servo(0);
+
+                    // Tat LED
+                    HAL_GPIO_WritePin(
+                        GPIOA, GPIO_PIN_3, GPIO_PIN_RESET
+                    );
+               
+								}else{
+									lcd_clear();
+									HAL_Delay(300);                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             
+								lcd_send_string(" sai the ");
+                // The sai: khong mo cua, khong bat LED
             }
 
+            // Dua the vao trang thai HALT
             MFRC522_Halt();
         }
     }
+    else
+    {
+        // Khong phat hien the
+        if (da_xu_ly_the == 1)
+        {
+            if (thoi_diem_mat_the == 0)
+            {
+                thoi_diem_mat_the = HAL_GetTick();
+            }
 
-    HAL_Delay(100);
-}
+            // Mat the lien tuc 500 ms moi cho phep quet lai
+            if (HAL_GetTick() - thoi_diem_mat_the >= 500)
+            {
+                da_xu_ly_the = 0;
+                thoi_diem_mat_the = 0;
+            }
+        }
+    }
 
-    /* USER CODE END WHILE */
-
-    /* USER CODE BEGIN 3 */
-  }
-  /* USER CODE END 3 */
-}
+    HAL_Delay(50);
+	}
 
 /**
   * @brief System Clock Configuration
