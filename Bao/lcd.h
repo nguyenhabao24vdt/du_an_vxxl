@@ -12,4 +12,5 @@ void lcd_send_command(uint8_t cmd);
 void lcd_init(void);
 void lcd_send_string(char *str);
 void lcd_clear(void);
+void lcd_set_cusor(uint8_t cot, uint8_t hang);
 #endif

@@ -39,9 +39,13 @@ HAL_Delay(30);
 void lcd_init(){
 	HAL_Delay(30);
 	lcd_send_command(0x30);
+	HAL_Delay(1);
 	lcd_send_command(0x20);
+  HAL_Delay(1);
 	lcd_send_command(0x28);// 4  bit interface
+	HAL_Delay(1);
 	lcd_send_command(0x08);
+	HAL_Delay(1);
 	lcd_send_command(0x01);// clear
 	HAL_Delay(5);
 	lcd_send_command(0x06);
@@ -55,4 +59,15 @@ void lcd_send_string(char *str){
 void lcd_clear(void){
     lcd_send_command(0x01);// clear
     HAL_Delay(2);
+}
+void lcd_set_cusor( uint8_t cot , uint8_t hang){
+switch (hang) {
+        case 0:
+            cot |= 0x80;
+            break;
+        case 1:
+            cot	|= 0xC0;
+            break;
+    }
+    lcd_send_command(cot);
 }
