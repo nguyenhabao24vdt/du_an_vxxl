@@ -18,8 +18,8 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "stdio.h"
 #include "lcd.h"
+#include"stdio.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 
@@ -58,15 +58,11 @@ static void MX_TIM2_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_I2C1_Init(void);
 /* USER CODE BEGIN PFP */
-void delay_us(uint16_t time)
-{
-    __HAL_TIM_SET_COUNTER(&htim2, 0);
+void delay_us(uint16_t time_us){
     HAL_TIM_Base_Start(&htim2);
-
-    while (__HAL_TIM_GET_COUNTER(&htim2) < time)
-    {
+    htim2.Instance->CNT = 0;
+    while(htim2.Instance->CNT < time_us){
     }
-
     HAL_TIM_Base_Stop(&htim2);
 }
 void set_output(){
@@ -108,7 +104,7 @@ if(HAL_GPIO_ReadPin(GPIOA,GPIO_PIN_1)==1){
 	res=(res<<1) |1;
 }else{
 	// bit 0
-	res=(res <<1) &0;
+		res=(res << 1) & ~(1 << 0);
 }
 // res :8 bit (1 byte)
 while(HAL_GPIO_ReadPin(GPIOA,GPIO_PIN_1)==1){}// DOI BANG 0
@@ -124,7 +120,7 @@ uint8_t checksum =0;
 
 void dht11_handle(){
 dht11_start();
-	int_hum   = dht11_read();  
+	  int_hum = dht11_read();  
     float_hum = dht11_read();  
     int_tem   = dht11_read();  
     float_tem = dht11_read();  
@@ -170,29 +166,30 @@ int main(void)
   MX_USART1_UART_Init();
   MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
-lcd_init();
+  
   /* USER CODE END 2 */
-char t [16] ;
-char h [16] ;
+  char a[100];
+lcd_init();
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
     /* USER CODE END WHILE */
-		dht11_handle();
-			HAL_Delay(1500);		
+      dht11_handle();
+				
                         
 
 
-sprintf(t, "Temp: %d.%d C   ", int_tem, float_tem);
-lcd_set_cusor(0, 0);
-lcd_send_string(t); 
+       sprintf(a, "Nhiet do: %02d C", int_tem);
+	     lcd_set_cusor(0, 0);
+	     lcd_send_string(a);
 
+	     // Hi?n th? d? ?m
+	     sprintf(a, "Do am: %02d %%", int_hum);
+	     lcd_set_cusor(1, 0);
+	     lcd_send_string(a);
 
-sprintf(h, "Hum : %d.%d %%   ", int_hum, float_hum);
-lcd_set_cusor(0, 1);
-lcd_send_string(h); 
-	
+	     HAL_Delay(2000);
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
