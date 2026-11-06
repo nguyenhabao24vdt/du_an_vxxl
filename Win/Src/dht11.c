@@ -1,122 +1,84 @@
-/*
- * dht11.c
- *
- *  Created on: Oct 21, 2026
- *      Author: LENOVO
- */
-
 #include "dht11.h"
 
-#define DHT11_PORT GPIOA
-#define DHT11_PIN  GPIO_PIN_2
+#define DHT_PORT GPIOA
+#define DHT_PIN  GPIO_PIN_2
 
-static void DHT11_DelayUs(uint32_t us)
+static uint32_t cycles_per_us;
+
+static void pin_mode(uint32_t output)
 {
-    uint32_t start = DWT->CYCCNT;
-    uint32_t ticks = us * (HAL_RCC_GetHCLKFreq() / 1000000U);
-
-    while ((DWT->CYCCNT - start) < ticks);
+    GPIO_InitTypeDef p = {0};
+    p.Pin = DHT_PIN;
+    p.Speed = GPIO_SPEED_FREQ_LOW;
+    if (output) {
+        p.Mode = GPIO_MODE_OUTPUT_OD;
+    } else {
+        p.Mode = GPIO_MODE_INPUT;
+        p.Pull = GPIO_PULLUP;
+    }
+    HAL_GPIO_Init(DHT_PORT, &p);
 }
 
-static void DHT11_DWT_Init(void)
+static void wait_us(uint32_t us)
 {
+    uint32_t start = DWT->CYCCNT;
+    uint32_t cycles = us * cycles_per_us;
+    while ((uint32_t)(DWT->CYCCNT - start) < cycles) {}
+}
+
+/* Wait until DATA reaches expected level, limited by microsecond timeout. */
+static uint8_t wait_level(GPIO_PinState level, uint32_t timeout_us)
+{
+    uint32_t start = DWT->CYCCNT;
+    uint32_t cycles = timeout_us * cycles_per_us;
+    while (HAL_GPIO_ReadPin(DHT_PORT, DHT_PIN) != level) {
+        if ((uint32_t)(DWT->CYCCNT - start) >= cycles) return 0;
+    }
+    return 1;
+}
+
+void DHT11_Init(void)
+{
+    __HAL_RCC_GPIOA_CLK_ENABLE();
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
     DWT->CYCCNT = 0;
     DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+    cycles_per_us = HAL_RCC_GetHCLKFreq() / 1000000U;
+    if (cycles_per_us == 0) cycles_per_us = 1;
+    HAL_GPIO_WritePin(DHT_PORT, DHT_PIN, GPIO_PIN_SET);
+    pin_mode(0);
 }
 
-static void DHT11_PinOutput(void)
-{
-    GPIO_InitTypeDef GPIO_InitStruct = {0};
-
-    GPIO_InitStruct.Pin = DHT11_PIN;
-    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
-    GPIO_InitStruct.Pull = GPIO_PULLUP;
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-
-    HAL_GPIO_Init(DHT11_PORT, &GPIO_InitStruct);
-}
-
-static void DHT11_PinInput(void)
-{
-    GPIO_InitTypeDef GPIO_InitStruct = {0};
-
-    GPIO_InitStruct.Pin = DHT11_PIN;
-    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-    GPIO_InitStruct.Pull = GPIO_PULLUP;
-
-    HAL_GPIO_Init(DHT11_PORT, &GPIO_InitStruct);
-}
-
-static uint8_t DHT11_WaitLevel(GPIO_PinState level,
-                               uint32_t timeout_us)
-{
-    while (HAL_GPIO_ReadPin(DHT11_PORT, DHT11_PIN) != level)
-    {
-        if (timeout_us == 0)
-            return 0;
-
-        DHT11_DelayUs(1);
-        timeout_us--;
-    }
-
-    return 1;
-}
-
-uint8_t DHT11_Read(uint8_t *temperature, uint8_t *humidity)
+HAL_StatusTypeDef DHT11_Read(uint8_t *temperature, uint8_t *humidity)
 {
     uint8_t data[5] = {0};
+    if (!temperature || !humidity) return HAL_ERROR;
+    if (!(DWT->CTRL & DWT_CTRL_CYCCNTENA_Msk)) return HAL_ERROR;
 
-    if (temperature == NULL || humidity == NULL)
-        return 0;
-
-    DHT11_DWT_Init();
-
-    DHT11_PinOutput();
-    HAL_GPIO_WritePin(DHT11_PORT, DHT11_PIN, GPIO_PIN_RESET);
+    /* MCU start: LOW >= 18ms, then release DATA. */
+    HAL_GPIO_WritePin(DHT_PORT, DHT_PIN, GPIO_PIN_RESET);
+    pin_mode(1);
     HAL_Delay(20);
+    HAL_GPIO_WritePin(DHT_PORT, DHT_PIN, GPIO_PIN_SET); /* open drain releases */
+    wait_us(30);
+    pin_mode(0);
 
-    HAL_GPIO_WritePin(DHT11_PORT, DHT11_PIN, GPIO_PIN_SET);
-    DHT11_DelayUs(30);
+    if (!wait_level(GPIO_PIN_RESET, 110)) return HAL_TIMEOUT;
+    if (!wait_level(GPIO_PIN_SET,   110)) return HAL_TIMEOUT;
+    if (!wait_level(GPIO_PIN_RESET, 110)) return HAL_TIMEOUT;
 
-    DHT11_PinInput();
-
-    if (!DHT11_WaitLevel(GPIO_PIN_RESET, 100))
-        return 0;
-
-    if (!DHT11_WaitLevel(GPIO_PIN_SET, 100))
-        return 0;
-
-    if (!DHT11_WaitLevel(GPIO_PIN_RESET, 100))
-        return 0;
-
-    for (uint8_t i = 0; i < 40; i++)
-    {
-        if (!DHT11_WaitLevel(GPIO_PIN_SET, 100))
-            return 0;
-
-        DHT11_DelayUs(40);
-
-        if (HAL_GPIO_ReadPin(DHT11_PORT, DHT11_PIN)
-            == GPIO_PIN_SET)
-        {
-            data[i / 8] |= (uint8_t)(1U << (7 - (i % 8)));
-        }
-
-        if (!DHT11_WaitLevel(GPIO_PIN_RESET, 100))
-            return 0;
+    for (uint8_t i = 0; i < 40; i++) {
+        if (!wait_level(GPIO_PIN_SET, 90)) return HAL_TIMEOUT;  /* end ~50us LOW */
+        wait_us(40);  /* sample in HIGH pulse: ~28us means 0, ~70us means 1 */
+        data[i / 8] <<= 1;
+        if (HAL_GPIO_ReadPin(DHT_PORT, DHT_PIN) == GPIO_PIN_SET)
+            data[i / 8] |= 1;
+        if (!wait_level(GPIO_PIN_RESET, 100)) return HAL_TIMEOUT;
     }
 
-    if ((uint8_t)(data[0] + data[1] + data[2] + data[3])
-        != data[4])
-    {
-        return 0;
-    }
-
+    if ((uint8_t)(data[0] + data[1] + data[2] + data[3]) != data[4])
+        return HAL_ERROR;
     *humidity = data[0];
     *temperature = data[2];
-
-    return 1;
+    return HAL_OK;
 }
-
-
