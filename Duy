@@ -1,0 +1,390 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Mái che mưa thông minh (STM32F103C8T6 + Servo + Cảm biến mưa ADC)
+  *
+  * Cấu hình phần cứng:
+  *   - Servo      : PA0 (TIM2_CH1, PWM 50 Hz), nguồn 5V riêng, chung GND với STM32
+  *   - Cảm biến   : PA1 (ADC1_IN1), nguồn 3.3V
+  *
+  * Hoạt động:
+  *   - Tự động mở/đóng mái che dựa trên cảm biến mưa (có trễ Hysteresis).
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+/* --- Ngưỡng cảm biến (wetness càng lớn càng ướt, thang 0..4095) --- */
+#define RAIN_ON_THRESHOLD     2200U   // wetness >= giá trị này: coi là có mưa
+#define RAIN_OFF_THRESHOLD    1600U   // wetness <= giá trị này: coi là khô (khoảng trễ Hysteresis)
+
+/* --- Thời gian xác nhận --- */
+#define RAIN_CONFIRM_MS       1500U   // Phải ướt liên tục 1,5 s mới xác nhận MƯA
+#define DRY_CONFIRM_MS       10000U   // Phải khô liên tục 10 s mới xác nhận TẠNH
+
+/* --- Chu kỳ tác vụ --- */
+#define SAMPLE_PERIOD_MS        50U   // Đọc cảm biến mỗi 50 ms
+
+/* --- Servo --- */
+#define SERVO_OPEN_ANGLE       180U   // Góc mở mái che (độ)
+#define SERVO_CLOSE_ANGLE        0U   // Góc đóng mái che (độ)
+#define SERVO_STEP_PERIOD_MS    15U   // Cứ 15 ms dịch 1 độ để servo quay mềm
+#define SERVO_MIN_US           500U   // Độ rộng xung ứng với 0 độ (SG90/MG90S: ~500 us)
+#define SERVO_MAX_US          2500U   // Độ rộng xung ứng với 180 độ (SG90/MG90S: ~2500 us)
+
+/* --- Cảm biến --- */
+#define RAIN_SENSOR_INVERT       1U   // 1: module có AO GIẢM khi ướt (đa số module) -> đảo 4095-raw
+                                      // 0: module có AO TĂNG khi ướt -> dùng thẳng raw
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
+TIM_HandleTypeDef htim2;
+
+/* USER CODE BEGIN PV */
+static uint8_t  servoCurrent = SERVO_CLOSE_ANGLE; // Góc hiện tại của servo
+static uint8_t  servoTarget  = SERVO_CLOSE_ANGLE; // Góc đích servo cần tới
+static uint8_t  isRaining    = 0U;                // 0: Khô, 1: Mưa
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_ADC1_Init(void);
+static void MX_TIM2_Init(void);
+/* USER CODE BEGIN PFP */
+
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+
+/* Đặt góc servo bằng cách đổi độ rộng xung PWM (1 tick = 1 us) */
+static void Servo_SetAngle(uint8_t angle)
+{
+    if (angle > 180U) angle = 180U;                                   // Giới hạn góc tối đa
+    uint16_t pulse = (uint16_t)(SERVO_MIN_US +
+                     ((uint32_t)angle * (SERVO_MAX_US - SERVO_MIN_US)) / 180U); // Quy đổi góc -> us
+    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, pulse);              // Ghi vào thanh ghi CCR1
+}
+
+/* Dịch servo từng độ một về góc đích để quay mềm, không giật */
+static void Servo_Update(uint32_t now)
+{
+    static uint32_t lastStep = 0U;                                    // Thời điểm bước gần nhất
+    if (servoCurrent == servoTarget ||                                // Đã tới đích thì thôi
+        (uint32_t)(now - lastStep) < SERVO_STEP_PERIOD_MS)            // Chưa đủ 15 ms thì chờ
+        return;
+
+    lastStep = now;                                                   // Ghi lại thời điểm bước
+    if (servoCurrent < servoTarget) servoCurrent++;                   // Tiến lên 1 độ
+    else                            servoCurrent--;                   // Lùi xuống 1 độ
+
+    Servo_SetAngle(servoCurrent);                                     // Xuất xung mới
+}
+
+/* Đọc ADC lấy trung bình 8 mẫu, trả về wetness (càng ướt càng lớn) */
+static uint16_t Read_ADC_Filtered(void)
+{
+    static uint16_t lastWetness = 0U;                                 // Giá trị hợp lệ gần nhất
+    uint32_t sum = 0U;                                                // Tổng các mẫu
+    uint8_t  cnt = 0U;                                                // Số mẫu đọc thành công
+
+    for (uint8_t i = 0U; i < 8U; i++)
+    {
+        HAL_ADC_Start(&hadc1);                                        // Bắt đầu 1 lần chuyển đổi
+        if (HAL_ADC_PollForConversion(&hadc1, 5U) == HAL_OK)          // Chờ xong (tối đa 5 ms)
+        {
+            sum += HAL_ADC_GetValue(&hadc1);                          // Cộng giá trị đọc được
+            cnt++;                                                    // Đếm mẫu hợp lệ
+        }
+        HAL_ADC_Stop(&hadc1);                                         // Dừng ADC
+    }
+
+    if (cnt == 0U) return lastWetness;                                // Không mẫu nào hợp lệ: giữ giá trị cũ
+
+    uint16_t raw = (uint16_t)(sum / cnt);                             // Trung bình theo số mẫu thực
+#if RAIN_SENSOR_INVERT
+    lastWetness = (uint16_t)(4095U - raw);                            // AO giảm khi ướt -> đảo lại
+#else
+    lastWetness = raw;                                                // AO tăng khi ướt -> giữ nguyên
+#endif
+    return lastWetness;
+}
+/* USER CODE END 0 */
+
+/**
+  * @brief  Điểm vào chương trình
+  * @retval int
+  */
+int main(void)
+{
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* Khởi tạo thư viện HAL */
+  HAL_Init();
+
+  /* Cấu hình Clock hệ thống */
+  SystemClock_Config();
+
+  /* Khởi tạo tất cả các ngoại vi được cấu hình */
+  MX_GPIO_Init();
+  MX_ADC1_Init();
+  MX_TIM2_Init();
+
+  /* USER CODE BEGIN 2 */
+  /* Hiệu chuẩn ADC để giảm sai số (bắt buộc làm sau khi init, trước khi đọc) */
+  if (HAL_ADCEx_Calibration_Start(&hadc1) != HAL_OK)
+      Error_Handler();
+
+  /* Bật xuất PWM TIM2 kênh 1 ra chân PA0 */
+  if (HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1) != HAL_OK)
+      Error_Handler();
+
+  /* Đặt góc ban đầu ở vị trí đóng (giả định mái đang đóng lúc cấp điện) */
+  Servo_SetAngle(SERVO_CLOSE_ANGLE);
+
+  uint8_t  wetCounting = 0U, dryCounting = 0U;     // Cờ: đang đếm thời gian ướt / khô
+  uint32_t wetStart = 0U, dryStart = 0U;           // Thời điểm bắt đầu đếm
+  uint32_t lastSample = HAL_GetTick();             // Lần đọc cảm biến gần nhất
+  uint16_t wetness = 0U;                           // Độ ẩm sau khi lọc
+  /* USER CODE END 2 */
+
+  /* Vòng lặp vô hạn */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+    uint32_t now = HAL_GetTick();                  // Thời gian hiện tại (ms)
+
+    /* 1. Đọc cảm biến mỗi 50 ms */
+    if ((uint32_t)(now - lastSample) >= SAMPLE_PERIOD_MS)
+    {
+        lastSample = now;
+        wetness = Read_ADC_Filtered();             // Đọc độ ẩm đã lọc
+
+        /* --- MƯA -> MỞ MÁI --- */
+        if (wetness >= RAIN_ON_THRESHOLD)
+        {
+            dryCounting = 0U;                  // Hủy đếm thời gian khô
+            if (!wetCounting)                  // Lần đầu vượt ngưỡng
+            {
+                wetCounting = 1U;
+                wetStart = now;                // Bắt đầu đếm
+            }
+            else if (!isRaining && (uint32_t)(now - wetStart) >= RAIN_CONFIRM_MS)
+            {
+                isRaining   = 1U;              // Xác nhận có mưa
+                servoTarget = SERVO_OPEN_ANGLE;
+            }
+        }
+        else
+        {
+            wetCounting = 0U;                  // Hết ướt thì hủy đếm
+        }
+
+        /* --- KHÔ -> ĐÓNG MÁI --- */
+        if (wetness <= RAIN_OFF_THRESHOLD)
+        {
+            wetCounting = 0U;                  // Hủy đếm thời gian mưa
+            if (!dryCounting)                  // Lần đầu xuống dưới ngưỡng
+            {
+                dryCounting = 1U;
+                dryStart = now;                // Bắt đầu đếm
+            }
+            else if (isRaining && (uint32_t)(now - dryStart) >= DRY_CONFIRM_MS)
+            {
+                isRaining   = 0U;              // Xác nhận đã tạnh
+                servoTarget = SERVO_CLOSE_ANGLE;
+            }
+        }
+        else
+        {
+            dryCounting = 0U;                  // Không còn khô thì hủy đếm
+        }
+    }
+
+    /* 2. Dịch servo mềm mại về góc đích */
+    Servo_Update(now);
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief Cấu hình xung nhịp hệ thống (72 MHz từ thạch anh ngoài 8 MHz)
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+  RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
+
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL9;           // 8 MHz x 9 = 72 MHz
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;      // APB1 = 36 MHz, timer APB1 = 72 MHz
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;      // APB2 = 72 MHz
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_ADC;
+  PeriphClkInit.AdcClockSelection = RCC_ADCPCLK2_DIV6;   // 72 MHz / 6 = 12 MHz (tối đa 14 MHz)
+  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief Khởi tạo ADC1 (PA1 / Channel 1)
+  * @retval None
+  */
+static void MX_ADC1_Init(void)
+{
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  hadc1.Instance = ADC1;
+  hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.NbrOfConversion = 1;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  sConfig.Channel = ADC_CHANNEL_1;
+  sConfig.Rank = ADC_REGULAR_RANK_1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_239CYCLES_5;     // Lấy mẫu lâu cho kết quả ổn định
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief Khởi tạo TIM2 (PA0 / Channel 1, PWM 50 Hz)
+  * @retval None
+  */
+static void MX_TIM2_Init(void)
+{
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 71;                             // 72 MHz / 72 = 1 MHz -> 1 tick = 1 us
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 19999;                             // 20.000 tick = 20 ms (50 Hz)
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  if (HAL_TIM_PWM_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = SERVO_MIN_US;                        // Xung ban đầu = vị trí 0 độ
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  HAL_TIM_MspPostInit(&htim2);                           // Cấu hình PA0 thành AF Push-Pull
+}
+
+/**
+  * @brief Khởi tạo GPIO (chỉ bật clock cổng)
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  /* Bật clock các cổng GPIO (PA0, PA1 do TIM2/ADC1 tự cấu hình trong MSP) */
+  __HAL_RCC_GPIOD_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+}
+
+/* USER CODE BEGIN 4 */
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  Hàm xử lý khi xảy ra lỗi hệ thống
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  __disable_irq();
+  while (1)
+  {
+  }
+}
+
+#ifdef USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line)
+{
+}
+#endif /* USE_FULL_ASSERT */
