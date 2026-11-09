@@ -2,26 +2,26 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Mái che mưa thông minh (STM32F103C8T6 + Servo + Cảm biến mưa ADC)
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
   *
-  * Cấu hình phần cứng:
-  *   - Servo      : PA0 (TIM2_CH1, PWM 50 Hz), nguồn 5V riêng, chung GND với STM32
-  *   - Cảm biến   : PA1 (ADC1_IN1), nguồn 3.3V
-  *   - UART1      : PA9 (TX), PA10 (RX), 115200 baud
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
   *
-  * Hoạt động:
-  *   - Tự động mở/đóng mái che dựa trên cảm biến mưa (có trễ Hysteresis).
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
   ******************************************************************************
   */
 /* USER CODE END Header */
-
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include <stdio.h>      // snprintf
-#include <string.h>     // strlen
+#include "gas_app.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -31,28 +31,7 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-/* --- Ngưỡng cảm biến (wetness càng lớn càng ướt, thang 0..4095) --- */
-#define RAIN_ON_THRESHOLD     2200U   // wetness >= giá trị này: coi là có mưa
-#define RAIN_OFF_THRESHOLD    1600U   // wetness <= giá trị này: coi là khô (khoảng trễ Hysteresis)
 
-/* --- Thời gian xác nhận --- */
-#define RAIN_CONFIRM_MS       1500U   // Phải ướt liên tục 1,5 s mới xác nhận MƯA
-#define DRY_CONFIRM_MS       10000U   // Phải khô liên tục 10 s mới xác nhận TẠNH
-
-/* --- Chu kỳ tác vụ --- */
-#define SAMPLE_PERIOD_MS        50U   // Đọc cảm biến mỗi 50 ms
-#define REPORT_PERIOD_MS       500U   // In UART mỗi 500 ms
-
-/* --- Servo --- */
-#define SERVO_OPEN_ANGLE       180U   // Góc mở mái che (độ)
-#define SERVO_CLOSE_ANGLE        0U   // Góc đóng mái che (độ)
-#define SERVO_STEP_PERIOD_MS    15U   // Cứ 15 ms dịch 1 độ để servo quay mềm
-#define SERVO_MIN_US           500U   // Độ rộng xung ứng với 0 độ (SG90/MG90S: ~500 us)
-#define SERVO_MAX_US          2500U   // Độ rộng xung ứng với 180 độ (SG90/MG90S: ~2500 us)
-
-/* --- Cảm biến --- */
-#define RAIN_SENSOR_INVERT       1U   // 1: module có AO GIẢM khi ướt (đa số module) -> đảo 4095-raw
-                                      // 0: module có AO TĂNG khi ướt -> dùng thẳng raw
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -62,21 +41,18 @@
 
 /* Private variables ---------------------------------------------------------*/
 ADC_HandleTypeDef hadc1;
-TIM_HandleTypeDef htim2;
-UART_HandleTypeDef huart1;
+
+TIM_HandleTypeDef htim4;
 
 /* USER CODE BEGIN PV */
-static uint8_t  servoCurrent = SERVO_CLOSE_ANGLE; // Góc hiện tại của servo
-static uint8_t  servoTarget  = SERVO_CLOSE_ANGLE; // Góc đích servo cần tới
-static uint8_t  isRaining    = 0U;                // 0: Khô, 1: Mưa
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_ADC1_Init(void);
-static void MX_TIM2_Init(void);
-static void MX_USART1_UART_Init(void);
+static void MX_TIM4_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -84,191 +60,57 @@ static void MX_USART1_UART_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-/* In một chuỗi ra UART1 */
-static void UART_Print(const char *str)
-{
-    HAL_UART_Transmit(&huart1, (uint8_t *)str, (uint16_t)strlen(str), 100U);
-}
-
-/* Đặt góc servo bằng cách đổi độ rộng xung PWM (1 tick = 1 us) */
-static void Servo_SetAngle(uint8_t angle)
-{
-    if (angle > 180U) angle = 180U;                                   // Giới hạn góc tối đa
-    uint16_t pulse = (uint16_t)(SERVO_MIN_US +
-                     ((uint32_t)angle * (SERVO_MAX_US - SERVO_MIN_US)) / 180U); // Quy đổi góc -> us
-    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, pulse);              // Ghi vào thanh ghi CCR1
-}
-
-/* Dịch servo từng độ một về góc đích để quay mềm, không giật */
-static void Servo_Update(uint32_t now)
-{
-    static uint32_t lastStep = 0U;                                    // Thời điểm bước gần nhất
-    if (servoCurrent == servoTarget ||                                // Đã tới đích thì thôi
-        (uint32_t)(now - lastStep) < SERVO_STEP_PERIOD_MS)            // Chưa đủ 15 ms thì chờ
-        return;
-
-    lastStep = now;                                                   // Ghi lại thời điểm bước
-    if (servoCurrent < servoTarget) servoCurrent++;                   // Tiến lên 1 độ
-    else                            servoCurrent--;                   // Lùi xuống 1 độ
-
-    Servo_SetAngle(servoCurrent);                                     // Xuất xung mới
-}
-
-/* Đọc ADC lấy trung bình 8 mẫu, trả về wetness (càng ướt càng lớn) */
-static uint16_t Read_ADC_Filtered(void)
-{
-    static uint16_t lastWetness = 0U;                                 // Giá trị hợp lệ gần nhất
-    uint32_t sum = 0U;                                                // Tổng các mẫu
-    uint8_t  cnt = 0U;                                                // Số mẫu đọc thành công
-
-    for (uint8_t i = 0U; i < 8U; i++)
-    {
-        HAL_ADC_Start(&hadc1);                                        // Bắt đầu 1 lần chuyển đổi
-        if (HAL_ADC_PollForConversion(&hadc1, 5U) == HAL_OK)          // Chờ xong (tối đa 5 ms)
-        {
-            sum += HAL_ADC_GetValue(&hadc1);                          // Cộng giá trị đọc được
-            cnt++;                                                    // Đếm mẫu hợp lệ
-        }
-        HAL_ADC_Stop(&hadc1);                                         // Dừng ADC
-    }
-
-    if (cnt == 0U) return lastWetness;                                // Không mẫu nào hợp lệ: giữ giá trị cũ
-
-    uint16_t raw = (uint16_t)(sum / cnt);                             // Trung bình theo số mẫu thực
-#if RAIN_SENSOR_INVERT
-    lastWetness = (uint16_t)(4095U - raw);                            // AO giảm khi ướt -> đảo lại
-#else
-    lastWetness = raw;                                                // AO tăng khi ướt -> giữ nguyên
-#endif
-    return lastWetness;
-}
 /* USER CODE END 0 */
 
 /**
-  * @brief  Điểm vào chương trình
+  * @brief  The application entry point.
   * @retval int
   */
 int main(void)
 {
+
   /* USER CODE BEGIN 1 */
 
   /* USER CODE END 1 */
 
-  /* Khởi tạo thư viện HAL */
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
 
-  /* Cấu hình Clock hệ thống */
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
   SystemClock_Config();
 
-  /* Khởi tạo tất cả các ngoại vi được cấu hình */
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_ADC1_Init();
-  MX_TIM2_Init();
-  MX_USART1_UART_Init();
-
+  MX_TIM4_Init();
   /* USER CODE BEGIN 2 */
-  /* Hiệu chuẩn ADC để giảm sai số (bắt buộc làm sau khi init, trước khi đọc) */
-  if (HAL_ADCEx_Calibration_Start(&hadc1) != HAL_OK)
-      Error_Handler();
-
-  /* Bật xuất PWM TIM2 kênh 1 ra chân PA0 */
-  if (HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1) != HAL_OK)
-      Error_Handler();
-
-  /* Đặt góc ban đầu ở vị trí đóng (giả định mái đang đóng lúc cấp điện) */
-  Servo_SetAngle(SERVO_CLOSE_ANGLE);
-
-  uint8_t  wetCounting = 0U, dryCounting = 0U;     // Cờ: đang đếm thời gian ướt / khô
-  uint32_t wetStart = 0U, dryStart = 0U;           // Thời điểm bắt đầu đếm
-  uint32_t lastSample = HAL_GetTick();             // Lần đọc cảm biến gần nhất
-  uint32_t lastReport = HAL_GetTick();             // Lần in UART gần nhất
-  uint16_t wetness = 0U;                           // Độ ẩm sau khi lọc
-  char msg[100];                                   // Bộ đệm chuỗi in UART
-
-  UART_Print("\r\n=========================================\r\n");
-  UART_Print("   SMART AWNING SYSTEM - STM32F103C8T6   \r\n");
-  UART_Print("=========================================\r\n");
+GasApp_Init();
   /* USER CODE END 2 */
 
-  /* Vòng lặp vô hạn */
+  /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    uint32_t now = HAL_GetTick();                  // Thời gian hiện tại (ms)
-
-    /* 1. Đọc cảm biến mỗi 50 ms */
-    if ((uint32_t)(now - lastSample) >= SAMPLE_PERIOD_MS)
-    {
-        lastSample = now;
-        wetness = Read_ADC_Filtered();             // Đọc độ ẩm đã lọc
-
-        /* --- MƯA -> MỞ MÁI --- */
-        if (wetness >= RAIN_ON_THRESHOLD)
-        {
-            dryCounting = 0U;                  // Hủy đếm thời gian khô
-            if (!wetCounting)                  // Lần đầu vượt ngưỡng
-            {
-                wetCounting = 1U;
-                wetStart = now;                // Bắt đầu đếm
-            }
-            else if (!isRaining && (uint32_t)(now - wetStart) >= RAIN_CONFIRM_MS)
-            {
-                isRaining   = 1U;              // Xác nhận có mưa
-                servoTarget = SERVO_OPEN_ANGLE;
-                UART_Print("[AUTO]: RAIN CONFIRMED -> OPEN AWNING\r\n");
-            }
-        }
-        else
-        {
-            wetCounting = 0U;                  // Hết ướt thì hủy đếm
-        }
-
-        /* --- KHÔ -> ĐÓNG MÁI --- */
-        if (wetness <= RAIN_OFF_THRESHOLD)
-        {
-            wetCounting = 0U;                  // Hủy đếm thời gian mưa
-            if (!dryCounting)                  // Lần đầu xuống dưới ngưỡng
-            {
-                dryCounting = 1U;
-                dryStart = now;                // Bắt đầu đếm
-            }
-            else if (isRaining && (uint32_t)(now - dryStart) >= DRY_CONFIRM_MS)
-            {
-                isRaining   = 0U;              // Xác nhận đã tạnh
-                servoTarget = SERVO_CLOSE_ANGLE;
-                UART_Print("[AUTO]: DRY CONFIRMED -> CLOSE AWNING\r\n");
-            }
-        }
-        else
-        {
-            dryCounting = 0U;                  // Không còn khô thì hủy đếm
-        }
-    }
-
-    /* 2. Dịch servo mềm mại về góc đích */
-    Servo_Update(now);
-
-    /* 3. In thông số hệ thống lên UART mỗi 500 ms */
-    if ((uint32_t)(now - lastReport) >= REPORT_PERIOD_MS)
-    {
-        lastReport = now;
-        snprintf(msg, sizeof(msg),
-                 "Wetness: %4u | Rain: %s | Awning: %s | Angle: %3u deg\r\n",
-                 (unsigned)wetness,
-                 isRaining ? "YES" : "NO ",
-                 (servoTarget == SERVO_OPEN_ANGLE) ? "OPEN  " : "CLOSED",
-                 (unsigned)servoCurrent);
-        UART_Print(msg);
-    }
+		 GasApp_Task();
   }
   /* USER CODE END 3 */
 }
 
 /**
-  * @brief Cấu hình xung nhịp hệ thống (72 MHz từ thạch anh ngoài 8 MHz)
+  * @brief System Clock Configuration
   * @retval None
   */
 void SystemClock_Config(void)
@@ -277,32 +119,36 @@ void SystemClock_Config(void)
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
   RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
 
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
-  RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL9;           // 8 MHz x 9 = 72 MHz
+  RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL9;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
     Error_Handler();
   }
 
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;      // APB1 = 36 MHz, timer APB1 = 72 MHz
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;      // APB2 = 72 MHz
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
   if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
   {
     Error_Handler();
   }
-
   PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_ADC;
-  PeriphClkInit.AdcClockSelection = RCC_ADCPCLK2_DIV6;   // 72 MHz / 6 = 12 MHz (tối đa 14 MHz)
+  PeriphClkInit.AdcClockSelection = RCC_ADCPCLK2_DIV6;
   if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
   {
     Error_Handler();
@@ -310,13 +156,25 @@ void SystemClock_Config(void)
 }
 
 /**
-  * @brief Khởi tạo ADC1 (PA1 / Channel 1)
+  * @brief ADC1 Initialization Function
+  * @param None
   * @retval None
   */
 static void MX_ADC1_Init(void)
 {
+
+  /* USER CODE BEGIN ADC1_Init 0 */
+
+  /* USER CODE END ADC1_Init 0 */
+
   ADC_ChannelConfTypeDef sConfig = {0};
 
+  /* USER CODE BEGIN ADC1_Init 1 */
+
+  /* USER CODE END ADC1_Init 1 */
+
+  /** Common config
+  */
   hadc1.Instance = ADC1;
   hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
   hadc1.Init.ContinuousConvMode = DISABLE;
@@ -329,95 +187,132 @@ static void MX_ADC1_Init(void)
     Error_Handler();
   }
 
-  sConfig.Channel = ADC_CHANNEL_1;
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_6;
   sConfig.Rank = ADC_REGULAR_RANK_1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_239CYCLES_5;     // Lấy mẫu lâu cho kết quả ổn định
+  sConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
   {
     Error_Handler();
   }
+  /* USER CODE BEGIN ADC1_Init 2 */
+
+  /* USER CODE END ADC1_Init 2 */
+
 }
 
 /**
-  * @brief Khởi tạo TIM2 (PA0 / Channel 1, PWM 50 Hz)
+  * @brief TIM4 Initialization Function
+  * @param None
   * @retval None
   */
-static void MX_TIM2_Init(void)
+static void MX_TIM4_Init(void)
 {
+
+  /* USER CODE BEGIN TIM4_Init 0 */
+
+  /* USER CODE END TIM4_Init 0 */
+
   TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
   TIM_OC_InitTypeDef sConfigOC = {0};
 
-  htim2.Instance = TIM2;
-  htim2.Init.Prescaler = 71;                             // 72 MHz / 72 = 1 MHz -> 1 tick = 1 us
-  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim2.Init.Period = 19999;                             // 20.000 tick = 20 ms (50 Hz)
-  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
-  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+  /* USER CODE BEGIN TIM4_Init 1 */
+
+  /* USER CODE END TIM4_Init 1 */
+  htim4.Instance = TIM4;
+  htim4.Init.Prescaler = 71;
+  htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim4.Init.Period = 999;
+  htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim4) != HAL_OK)
   {
     Error_Handler();
   }
-
   sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+  if (HAL_TIM_ConfigClockSource(&htim4, &sClockSourceConfig) != HAL_OK)
   {
     Error_Handler();
   }
-
-  if (HAL_TIM_PWM_Init(&htim2) != HAL_OK)
+  if (HAL_TIM_PWM_Init(&htim4) != HAL_OK)
   {
     Error_Handler();
   }
-
   sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim4, &sMasterConfig) != HAL_OK)
   {
     Error_Handler();
   }
-
   sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = SERVO_MIN_US;                        // Xung ban đầu = vị trí 0 độ
+  sConfigOC.Pulse = 0;
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  if (HAL_TIM_PWM_ConfigChannel(&htim4, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
   {
     Error_Handler();
   }
+  /* USER CODE BEGIN TIM4_Init 2 */
 
-  HAL_TIM_MspPostInit(&htim2);                           // Cấu hình PA0 thành AF Push-Pull
+  /* USER CODE END TIM4_Init 2 */
+  HAL_TIM_MspPostInit(&htim4);
+
 }
 
 /**
-  * @brief Khởi tạo USART1 (PA9-TX, PA10-RX, 115200 baud)
-  * @retval None
-  */
-static void MX_USART1_UART_Init(void)
-{
-  huart1.Instance = USART1;
-  huart1.Init.BaudRate = 115200;
-  huart1.Init.WordLength = UART_WORDLENGTH_8B;
-  huart1.Init.StopBits = UART_STOPBITS_1;
-  huart1.Init.Parity = UART_PARITY_NONE;
-  huart1.Init.Mode = UART_MODE_TX_RX;
-  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
-  if (HAL_UART_Init(&huart1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-}
-
-/**
-  * @brief Khởi tạo GPIO (chỉ bật clock cổng)
+  * @brief GPIO Initialization Function
+  * @param None
   * @retval None
   */
 static void MX_GPIO_Init(void)
 {
-  /* Bật clock các cổng GPIO (PA0, PA1, PA9, PA10 do TIM2/ADC1/USART1 tự cấu hình trong MSP) */
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+
+  /* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0|GPIO_PIN_12|GPIO_PIN_13|GPIO_PIN_14
+                          |GPIO_PIN_15|GPIO_PIN_5, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : PA1 */
+  GPIO_InitStruct.Pin = GPIO_PIN_1;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PA2 */
+  GPIO_InitStruct.Pin = GPIO_PIN_2;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : PB0 PB12 PB13 PB14
+                           PB15 PB5 */
+  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_12|GPIO_PIN_13|GPIO_PIN_14
+                          |GPIO_PIN_15|GPIO_PIN_5;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI1_IRQn, 2, 0);
+  HAL_NVIC_EnableIRQ(EXTI1_IRQn);
+
+  HAL_NVIC_SetPriority(EXTI2_IRQn, 2, 0);
+  HAL_NVIC_EnableIRQ(EXTI2_IRQn);
+
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+  /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
@@ -425,19 +320,32 @@ static void MX_GPIO_Init(void)
 /* USER CODE END 4 */
 
 /**
-  * @brief  Hàm xử lý khi xảy ra lỗi hệ thống
+  * @brief  This function is executed in case of error occurrence.
   * @retval None
   */
 void Error_Handler(void)
 {
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
   while (1)
   {
   }
+  /* USER CODE END Error_Handler_Debug */
 }
-
 #ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
 void assert_failed(uint8_t *file, uint32_t line)
 {
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
