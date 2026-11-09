@@ -1,56 +1,141 @@
+/* STM32F103C8T6 - integrated smart home
+ * LCD I2C1: PB8 SCL PB9 SDA (remap), address from existing library
+ * DHT11: PA10; Screen button: PA12 (active-low)
+ * RTC lamp: PA11 (17:00 to 05:00)
+ * Fan L9110S: PB4 TIM3_CH1 PWM -> IA; PB11 GPIO LOW -> IB
+ * RC522 SPI1: PA4 CS, PA5 SCK, PA6 MISO, PA7 MOSI, PB0 RST
+ * Door servo: PA8 TIM1_CH1; IR obstacle sensor OUT: PA3 (active-low)
+ * Rain sensor AO: PA1 ADC1_IN1; roof servo: PA0 TIM2_CH1
+ * Gas: PB1 ADC1_IN9; PB6 TIM4_CH1; GPIO PB5, PB7, PB12..PB15; EXTI PC13, PC14.
+ * SYSCLK 72 MHz; RTC HSE/128.
+ */
 #include "main.h"
 #include "clock_rtc.h"
 #include "dht11.h"
 #include "lcd1602_i2c.h"
 #include "fan.h"
-
+#include "rc522.h"
+#include "gas_app.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
-/* STM32F103C8T6, HSE 8 MHz, SYSCLK 72 MHz.
- * I2C1: PB8=SCL, PB9=SDA (remap)
- * DHT11: PA10, button: PA12 (active LOW), lamp: PA11 (active HIGH)
- * L9110S: PB10=IA (TIM2_CH3 PWM), PB11=IB (LOW)
- * TIM3_CH1: PB4 (partial remap), initialized but not started
- * RTC: HSE/128, prescaler 62499
- */
-#define FORCE_SET_TIME       0
+#define FORCE_SET_TIME       1
 #define BUTTON_DEBOUNCE_MS   30U
 #define DHT_PERIOD_MS        2000U
 #define LCD_POLL_MS          100U
 #define LAMP_PERIOD_MS       1000U
+#define RFID_PERIOD_MS       150U
+#define LCD_NOTICE_MS        3000U
+#define RAIN_NOTICE_MS       5000U
+#define RAIN_ICON_CHAR       ((char)1)
+/* ADC thresholds for LCD alerts. Match gas_app.c hardware alarms separately. */
+#define GAS_LEVEL1_ON        800U
+#define GAS_LEVEL2_ON        2000U
+#define GAS_LEVEL1_OFF       750U
+#define GAS_LEVEL2_OFF       1900U
+#define GAS_LCD_SAMPLE_MS    100U
+#define RAIN_SAMPLE_MS       50U
+#define RAIN_ON_THRESHOLD    2200U
+#define RAIN_OFF_THRESHOLD   1600U
+#define RAIN_CONFIRM_MS      1500U
+#define DRY_CONFIRM_MS       10000U
+#define RAIN_SENSOR_INVERT   1U
+#define SERVO_STEP_MS        15U
+#define SERVO_MIN_US         500U
+#define SERVO_MAX_US         2500U
+#define ROOF_OPEN_ANGLE      180U
+#define ROOF_CLOSE_ANGLE     0U
+#define DOOR_OPEN_ANGLE      130U
+#define DOOR_CLOSE_ANGLE     0U
+#define DOOR_IR_CLEAR_MS      3000U  /* close 3s after person leaves */
+#define DOOR_IR_DEBOUNCE_MS   50U    /* filter brief IR noise */
+#define DOOR_IR_ACTIVE        GPIO_PIN_RESET /* typical MH sensor OUT LOW */
 
 #define BUTTON_PORT GPIOA
-#define BUTTON_PIN  GPIO_PIN_12
-#define LAMP_PORT   GPIOA
-#define LAMP_PIN    GPIO_PIN_11
+#define BUTTON_PIN GPIO_PIN_12
+#define LAMP_PORT GPIOA
+#define LAMP_PIN GPIO_PIN_11
+#define DOOR_IR_PORT GPIOA
+#define DOOR_IR_PIN GPIO_PIN_3
 
 I2C_HandleTypeDef hi2c1;
-TIM_HandleTypeDef htim2;
-TIM_HandleTypeDef htim3;
+SPI_HandleTypeDef hspi1; /* rc522.c expects this exact global */
+ADC_HandleTypeDef hadc1;
+TIM_HandleTypeDef htim1; /* Door servo: PA8 */
+TIM_HandleTypeDef htim2; /* Rain servo: PA0 */
+TIM_HandleTypeDef htim3; /* Fan: PB4 */
+TIM_HandleTypeDef htim4; /* Gas app: PB6 TIM4_CH1 */
 
 typedef enum { SCREEN_CLOCK = 0, SCREEN_SENSOR = 1 } ScreenMode;
 typedef struct {
     ScreenMode screen;
-    uint8_t temperature;
-    uint8_t humidity;
-    uint8_t sensor_valid;
-    uint8_t display_dirty;
+    uint8_t temperature, humidity, sensor_valid, display_dirty;
 } AppState;
-static AppState app = {SCREEN_CLOCK, 0U, 0U, 0U, 1U};
+static AppState app = { SCREEN_CLOCK, 0U, 0U, 0U, 1U };
+
+static uint8_t roof_angle = ROOF_CLOSE_ANGLE;
+static uint8_t roof_target = ROOF_CLOSE_ANGLE;
+static uint8_t raining = 0U;
+static uint8_t door_open = 0U;
+/* One currently authorized UID. For several cards, store next direction per UID. */
+static uint8_t door_next_entry = 1U; /* 1=IN, 0=OUT */
+static uint8_t door_trip_entry = 1U;
+static uint8_t door_pass_detected = 0U;
+static uint32_t door_clear_since = 0U;
+static uint8_t door_clear_counting = 0U;
+/* Live Expressions: 1=object detected, 0=clear; direction 1=IN/2=OUT. */
+volatile uint8_t door_ir_debug = 0U;
+volatile uint8_t door_direction_debug = 0U;
+volatile uint32_t door_completed_debug = 0U;
+/* Watch in STM32CubeIDE Live Expressions. */
+volatile uint16_t gas_adc_debug = 0U;
+volatile uint8_t gas_level_debug = 0U; /* 0 = normal, 1 = warning, 2 = danger */
+
+typedef enum {
+    NOTICE_NONE = 0,
+    NOTICE_RAIN,
+    NOTICE_DRY,
+    NOTICE_DOOR_OPEN,
+    NOTICE_DOOR_CLOSE
+} NoticeType;
+static NoticeType notice = NOTICE_NONE;
+static uint32_t notice_started_ms = 0U;
+
+static void LCD_Notify(NoticeType type, uint32_t now)
+{
+    notice = type;
+    notice_started_ms = now;
+    app.display_dirty = 1U;
+}
 
 void SystemClock_Config(void);
 void Error_Handler(void);
 static void MX_GPIO_Init(void);
 static void MX_I2C1_Init(void);
+static void MX_SPI1_Init(void);
+static void MX_ADC1_Init(void);
+static void MX_TIM1_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_TIM3_Init(void);
+static void MX_TIM4_Init(void);
 static HAL_StatusTypeDef RTC_HSE128_Init(void);
 static void Button_Task(uint32_t now);
 static void DHT_Task(uint32_t now);
 static void Lamp_Task(uint32_t now);
 static void Display_Task(uint32_t now);
+static void Rain_Task(uint32_t now);
+static void Gas_Display_Task(uint32_t now);
+static void RFID_Task(uint32_t now);
+static void Door_IR_Task(uint32_t now);
+
+static void Servo_SetAngle(TIM_HandleTypeDef *timer, uint32_t channel, uint8_t angle)
+{
+    if (angle > 180U) angle = 180U;
+    uint32_t pulse = SERVO_MIN_US +
+        ((uint32_t)angle * (SERVO_MAX_US - SERVO_MIN_US)) / 180U;
+    __HAL_TIM_SET_COMPARE(timer, channel, pulse);
+}
 
 int main(void)
 {
@@ -58,30 +143,65 @@ int main(void)
     SystemClock_Config();
     MX_GPIO_Init();
     MX_I2C1_Init();
+    MX_SPI1_Init();
+    MX_ADC1_Init();
+    MX_TIM1_Init();
     MX_TIM2_Init();
     MX_TIM3_Init();
+    MX_TIM4_Init();
 
+    if (HAL_ADCEx_Calibration_Start(&hadc1) != HAL_OK) Error_Handler();
     if (RTC_HSE128_Init() != HAL_OK) Error_Handler();
     DHT11_Init();
 
-    /* Year, month, day, hour, minute, second */
-    const ClockDateTime initial = {2026, 11, 9, 17, 30, 0};
+    const ClockDateTime initial = { 2026, 11, 9, 12, 30, 0 };
     if (ClockRTC_Init(&initial) != HAL_OK) Error_Handler();
 #if FORCE_SET_TIME
     if (ClockRTC_Set(&initial) != HAL_OK) Error_Handler();
 #endif
 
     if (LCD1602_Init(&hi2c1) != HAL_OK) Error_Handler();
+
+    /* User-defined 5x8 rain/cloud icon stored at LCD CGRAM slot 1.
+     * Choose slot 1 (not slot 0) because line text is a C string. */
+    /* Cloud + rain, LCD1602 custom character 5 x 8. */
+    const uint8_t rain_icon[8] = {
+        0b01110, /*  ###  */
+        0b10001, /* #   # */
+        0b11111, /* ##### */
+        0b00000, /*       */
+        0b10101, /* # # # */
+        0b10101, /* # # # */
+        0b00000, /*       */
+        0b10101  /* # # # */
+    };
+    LCD1602_CreateChar(1U, rain_icon);
     app.display_dirty = 1U;
 
-    /* fan.c must use htim2, TIM_CHANNEL_3, PB11 LOW */
+    /* Use existing fan.c configured for TIM3_CH1 PB4 and GPIO PB11 LOW. */
     if (Fan_Init() != HAL_OK) Error_Handler();
     Fan_SetDuty(0U);
 
+    /* Both servos: 50 Hz timer, 1 us tick. */
+    if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1) != HAL_OK) Error_Handler();
+    if (HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1) != HAL_OK) Error_Handler();
+    Servo_SetAngle(&htim1, TIM_CHANNEL_1, DOOR_CLOSE_ANGLE);
+    Servo_SetAngle(&htim2, TIM_CHANNEL_1, ROOF_CLOSE_ANGLE);
+
+    MFRC522_Init();
+    GasApp_Init();
     Lamp_Task(HAL_GetTick());
+
     while (1) {
         uint32_t now = HAL_GetTick();
         Lamp_Task(now);
+        RFID_Task(now);
+        Door_IR_Task(now);
+        Rain_Task(now);
+        /* ADC1_IN9 restored by Rain_ReadWetness before gas task. */
+        GasApp_Task();
+        /* Read gas PB1 after GasApp_Task; ADC is shared with rain sensor. */
+        Gas_Display_Task(now);
         Button_Task(now);
         DHT_Task(now);
         Fan_Task(now, app.temperature, app.sensor_valid);
@@ -92,18 +212,13 @@ int main(void)
 static void Button_Task(uint32_t now)
 {
     static GPIO_PinState last_sample = GPIO_PIN_SET;
-    static GPIO_PinState stable_state = GPIO_PIN_SET;
-    static uint32_t last_change_ms = 0U;
+    static GPIO_PinState stable = GPIO_PIN_SET;
+    static uint32_t last_change = 0U;
     GPIO_PinState sample = HAL_GPIO_ReadPin(BUTTON_PORT, BUTTON_PIN);
-
-    if (sample != last_sample) {
-        last_sample = sample;
-        last_change_ms = now;
-    }
-    if ((uint32_t)(now - last_change_ms) >= BUTTON_DEBOUNCE_MS &&
-        sample != stable_state) {
-        stable_state = sample;
-        if (stable_state == GPIO_PIN_RESET) {
+    if (sample != last_sample) { last_sample = sample; last_change = now; }
+    if ((uint32_t)(now - last_change) >= BUTTON_DEBOUNCE_MS && sample != stable) {
+        stable = sample;
+        if (stable == GPIO_PIN_RESET) {
             app.screen = (app.screen == SCREEN_CLOCK) ? SCREEN_SENSOR : SCREEN_CLOCK;
             app.display_dirty = 1U;
         }
@@ -112,11 +227,10 @@ static void Button_Task(uint32_t now)
 
 static void DHT_Task(uint32_t now)
 {
-    static uint32_t last_read_ms = 0U;
+    static uint32_t last_ms = 0U;
     uint8_t temp, hum;
-    if ((uint32_t)(now - last_read_ms) < DHT_PERIOD_MS) return;
-    last_read_ms = now;
-
+    if ((uint32_t)(now - last_ms) < DHT_PERIOD_MS) return;
+    last_ms = now;
     if (DHT11_Read(&temp, &hum) == HAL_OK) {
         if (!app.sensor_valid || temp != app.temperature || hum != app.humidity)
             app.display_dirty = 1U;
@@ -131,13 +245,12 @@ static void DHT_Task(uint32_t now)
 
 static void Lamp_Task(uint32_t now)
 {
-    static uint32_t last_check_ms = 0U;
-    static uint8_t first_run = 1U;
+    static uint32_t last_ms = 0U;
+    static uint8_t first = 1U;
     ClockDateTime t;
-    if (!first_run && (uint32_t)(now - last_check_ms) < LAMP_PERIOD_MS) return;
-    first_run = 0U;
-    last_check_ms = now;
-
+    if (!first && (uint32_t)(now - last_ms) < LAMP_PERIOD_MS) return;
+    first = 0U;
+    last_ms = now;
     if (ClockRTC_Get(&t) != HAL_OK || t.hour >= 24U) {
         HAL_GPIO_WritePin(LAMP_PORT, LAMP_PIN, GPIO_PIN_RESET);
         return;
@@ -148,17 +261,50 @@ static void Lamp_Task(uint32_t now)
 
 static void Display_Task(uint32_t now)
 {
-    static uint32_t last_poll_ms = 0U;
-    static char previous_line1[17] = "";
-    static char previous_line2[17] = "";
-    char line1[17] = {0};
-    char line2[17] = {0};
-
-    if (!app.display_dirty && (uint32_t)(now - last_poll_ms) < LCD_POLL_MS)
-        return;
-    last_poll_ms = now;
-
-    if (app.screen == SCREEN_CLOCK) {
+    static uint32_t last_poll = 0U;
+    static char old1[17] = "";
+    static char old2[17] = "";
+    char line1[17] = {0}, line2[17] = {0};
+    if (!app.display_dirty && (uint32_t)(now - last_poll) < LCD_POLL_MS) return;
+    last_poll = now;
+    /* 1. GAS warning always overrides every other screen until normal. */
+    /* 2. Timed RFID/rain notifications, 3. ordinary RTC/DHT11 screen. */
+    if (notice != NOTICE_NONE) {
+        uint32_t duration = (notice == NOTICE_RAIN)
+                          ? RAIN_NOTICE_MS : LCD_NOTICE_MS;
+        if ((uint32_t)(now - notice_started_ms) >= duration) {
+            notice = NOTICE_NONE;
+            app.display_dirty = 1U;
+        }
+    }
+    if (gas_level_debug >= 2U) {
+        snprintf(line1, sizeof(line1), "GAS: LEVEL 2");
+        snprintf(line2, sizeof(line2), "ADC:%4u DANGER", (unsigned)gas_adc_debug);
+    } else if (gas_level_debug == 1U) {
+        snprintf(line1, sizeof(line1), "GAS: LEVEL 1");
+        snprintf(line2, sizeof(line2), "ADC:%4u ALERT", (unsigned)gas_adc_debug);
+    } else if (notice != NOTICE_NONE) {
+        switch (notice) {
+        case NOTICE_RAIN:
+            snprintf(line1, sizeof(line1), "RAIN: DETECTED");
+            snprintf(line2, sizeof(line2), "ROOF: OPENING");
+            break;
+        case NOTICE_DRY:
+            snprintf(line1, sizeof(line1), "RAIN: STOPPED");
+            snprintf(line2, sizeof(line2), "ROOF: CLOSING");
+            break;
+        case NOTICE_DOOR_OPEN:
+            snprintf(line1, sizeof(line1), "%s", door_trip_entry ? "ACCESS: ENTRY" : "ACCESS: EXIT");
+            snprintf(line2, sizeof(line2), "DOOR: OPEN");
+            break;
+        case NOTICE_DOOR_CLOSE:
+            snprintf(line1, sizeof(line1), "DOOR: CLOSED");
+            snprintf(line2, sizeof(line2), "%s", door_trip_entry ? "ENTRY COMPLETE" : "EXIT COMPLETE");
+            break;
+        default:
+            break;
+        }
+    } else if (app.screen == SCREEN_CLOCK) {
         ClockDateTime t;
         if (ClockRTC_Get(&t) == HAL_OK) {
             snprintf(line1, sizeof(line1), "TIME: %02u:%02u:%02u",
@@ -178,16 +324,256 @@ static void Display_Task(uint32_t now)
         snprintf(line1, sizeof(line1), "DHT11 NO DATA");
         snprintf(line2, sizeof(line2), "CHECK PA10");
     }
+    /* RAIN at row 1, col 12..15; rain icon at row 2, col 13.
+     * Only add to the ordinary sensor screen. Never overwrite gas alert.
+     * Clearing the strings on subsequent renders clears both when dry. */
+    if (gas_level_debug == 0U && notice == NOTICE_NONE &&
+        app.screen == SCREEN_SENSOR && raining) {
+        size_t len1 = strlen(line1);
+        size_t len2 = strlen(line2);
+        for (size_t i = len1; i < 12U; ++i) line1[i] = ' ';
+        line1[12] = 'R';
+        line1[13] = 'A';
+        line1[14] = 'I';
+        line1[15] = 'N';
+        line1[16] = '\0';
 
-    if (strcmp(line1, previous_line1) != 0) {
-        LCD1602_WriteLine(0, line1);
-        strcpy(previous_line1, line1);
+        for (size_t i = len2; i < 13U; ++i) line2[i] = ' ';
+        line2[13] = RAIN_ICON_CHAR;
+        line2[14] = ' ';
+        line2[15] = ' ';
+        line2[16] = '\0';
     }
-    if (strcmp(line2, previous_line2) != 0) {
+
+    if (strcmp(line1, old1) != 0) {
+        LCD1602_WriteLine(0, line1);
+        strcpy(old1, line1);
+    }
+    if (strcmp(line2, old2) != 0) {
         LCD1602_WriteLine(1, line2);
-        strcpy(previous_line2, line2);
+        strcpy(old2, line2);
     }
     app.display_dirty = 0U;
+}
+
+/* Update LCD warning level from gas ADC1_IN9, without slowing gas_app task.
+ * IMPORTANT: gas_app.c alarm thresholds must be changed there too.
+ * This polling method assumes gas_app uses the shared ADC in blocking mode.
+ */
+static void Gas_Display_Task(uint32_t now)
+{
+    static uint32_t last_sample = 0U;
+    ADC_ChannelConfTypeDef ch = {0};
+    uint16_t raw;
+    uint8_t next;
+
+    if ((uint32_t)(now - last_sample) < GAS_LCD_SAMPLE_MS) return;
+    last_sample = now;
+
+    ch.Channel = ADC_CHANNEL_9;  /* PB1, MQ2 AO */
+    ch.Rank = ADC_REGULAR_RANK_1;
+    ch.SamplingTime = ADC_SAMPLETIME_239CYCLES_5;
+    if (HAL_ADC_ConfigChannel(&hadc1, &ch) != HAL_OK) return;
+    if (HAL_ADC_Start(&hadc1) != HAL_OK) return;
+    if (HAL_ADC_PollForConversion(&hadc1, 5U) != HAL_OK) {
+        HAL_ADC_Stop(&hadc1);
+        return;
+    }
+
+    raw = (uint16_t)HAL_ADC_GetValue(&hadc1);
+    HAL_ADC_Stop(&hadc1);
+    gas_adc_debug = raw;
+
+    /* Hysteresis: raise level immediately; lower only below release threshold. */
+    next = gas_level_debug;
+    if (raw >= GAS_LEVEL2_ON) {
+        next = 2U;
+    } else if (raw >= GAS_LEVEL1_ON) {
+        if (next == 2U && raw >= GAS_LEVEL2_OFF) next = 2U;
+        else next = 1U;
+    } else {
+        if (next == 2U && raw >= GAS_LEVEL2_OFF) next = 2U;
+        else if (next >= 1U && raw >= GAS_LEVEL1_OFF) next = 1U;
+        else next = 0U;
+    }
+    if (next != gas_level_debug) {
+        gas_level_debug = next;
+        app.display_dirty = 1U;
+    }
+}
+
+/* Read 8 ADC samples, invert if sensor's AO decreases when wet. */
+static uint16_t Rain_ReadWetness(void)
+{
+    static uint16_t last_wetness = 0U;
+    uint32_t sum = 0U;
+    uint8_t count = 0U;
+    ADC_ChannelConfTypeDef adc_ch = {0};
+    adc_ch.Channel = ADC_CHANNEL_1;
+    adc_ch.Rank = ADC_REGULAR_RANK_1;
+    adc_ch.SamplingTime = ADC_SAMPLETIME_239CYCLES_5;
+    /* Rain reads PA1. ADC1 shared with gas (PB1). */
+    if (HAL_ADC_ConfigChannel(&hadc1, &adc_ch) != HAL_OK)
+        return last_wetness;
+    for (uint8_t i = 0U; i < 8U; ++i) {
+        if (HAL_ADC_Start(&hadc1) != HAL_OK) break;
+        if (HAL_ADC_PollForConversion(&hadc1, 5U) == HAL_OK) {
+            sum += HAL_ADC_GetValue(&hadc1);
+            count++;
+        }
+        HAL_ADC_Stop(&hadc1);
+    }
+    if (count != 0U) {
+        uint16_t raw = (uint16_t)(sum / count);
+#if RAIN_SENSOR_INVERT
+        last_wetness = (uint16_t)(4095U - raw);
+#else
+        last_wetness = raw;
+#endif
+    }
+    /* Restore PB1 ADC1_IN9 for GasApp_Task().
+     * This works when both apps use ADC polling sequentially.
+     * If GasApp uses DMA/interrupt ADC, coordination in gas_app.c is required. */
+    adc_ch.Channel = ADC_CHANNEL_9;
+    if (HAL_ADC_ConfigChannel(&hadc1, &adc_ch) != HAL_OK)
+        Error_Handler();
+    return last_wetness;
+}
+
+static void Rain_Task(uint32_t now)
+{
+    static uint32_t last_sample = 0U;
+    static uint32_t wet_since = 0U;
+    static uint32_t dry_since = 0U;
+    static uint8_t wet_counting = 0U, dry_counting = 0U;
+    static uint32_t last_step = 0U;
+
+    if ((uint32_t)(now - last_sample) >= RAIN_SAMPLE_MS) {
+        last_sample = now;
+        uint16_t wetness = Rain_ReadWetness();
+
+        if (wetness >= RAIN_ON_THRESHOLD) {
+            dry_counting = 0U;
+            if (!wet_counting) { wet_counting = 1U; wet_since = now; }
+            else if (!raining && (uint32_t)(now - wet_since) >= RAIN_CONFIRM_MS) {
+                raining = 1U;
+                roof_target = ROOF_OPEN_ANGLE;
+                /* After the 5 s rain message, stay on Temp/Humidity. */
+                app.screen = SCREEN_SENSOR;
+                LCD_Notify(NOTICE_RAIN, now);
+            }
+        } else {
+            wet_counting = 0U;
+        }
+        if (wetness <= RAIN_OFF_THRESHOLD) {
+            wet_counting = 0U;
+            if (!dry_counting) { dry_counting = 1U; dry_since = now; }
+            else if (raining && (uint32_t)(now - dry_since) >= DRY_CONFIRM_MS) {
+                raining = 0U;
+                roof_target = ROOF_CLOSE_ANGLE;
+                LCD_Notify(NOTICE_DRY, now);
+            }
+        } else {
+            dry_counting = 0U;
+        }
+    }
+
+    if (roof_angle != roof_target &&
+        (uint32_t)(now - last_step) >= SERVO_STEP_MS) {
+        last_step = now;
+        if (roof_angle < roof_target) roof_angle++;
+        else roof_angle--;
+        Servo_SetAngle(&htim2, TIM_CHANNEL_1, roof_angle);
+    }
+}
+
+/* UID from the supplied RFID door example (4-byte UID only). */
+static const uint8_t allowed_uid[4] = {0x5CU, 0x08U, 0x41U, 0x12U};
+
+static void RFID_Task(uint32_t now)
+{
+    static uint32_t last_poll = 0U;
+    static uint8_t card_latched = 0U;
+    static uint8_t no_card_count = 0U;
+    uint8_t buffer[MAX_LEN] = {0};
+
+    if ((uint32_t)(now - last_poll) < RFID_PERIOD_MS) return;
+    last_poll = now;
+
+    /* Try to see an IDLE or HALTed tag. */
+    if (MFRC522_Request(PICC_REQALL, buffer) != MI_OK) {
+        if (no_card_count < 3U) no_card_count++;
+        if (no_card_count >= 3U) card_latched = 0U;
+        return;
+    }
+
+    no_card_count = 0U;
+    if (card_latched) return;
+    if (MFRC522_Anticoll(buffer) != MI_OK) return;
+    card_latched = 1U;
+
+    if (memcmp(buffer, allowed_uid, 4U) == 0 && !door_open) {
+        /* Direction alternates only after a completed, sensed passage. */
+        door_trip_entry = door_next_entry;
+        door_direction_debug = door_trip_entry ? 1U : 2U;
+        door_pass_detected = 0U;
+        door_clear_counting = 0U;
+        door_clear_since = 0U;
+        door_open = 1U;
+        Servo_SetAngle(&htim1, TIM_CHANNEL_1, DOOR_OPEN_ANGLE);
+        LCD_Notify(NOTICE_DOOR_OPEN, now);
+    }
+    /* Do not call MFRC522_Halt: it is absent from user's rc522 library. */
+}
+
+/*
+ * IR: OUT LOW when obstacle detected (verify with Live Expressions).
+ * After a valid RFID scan, keep door open for as long as IR sees a person.
+ * Once the person has been seen AND leaves IR area, wait 3 s then close.
+ * No HAL_Delay(): other modules continue servicing gas, rain, LCD, etc.
+ */
+static void Door_IR_Task(uint32_t now)
+{
+    static GPIO_PinState previous_raw = GPIO_PIN_SET;
+    static GPIO_PinState stable_raw = GPIO_PIN_SET;
+    static uint32_t changed_at = 0U;
+    GPIO_PinState raw = HAL_GPIO_ReadPin(DOOR_IR_PORT, DOOR_IR_PIN);
+
+    if (raw != previous_raw) {
+        previous_raw = raw;
+        changed_at = now;
+    }
+    if ((uint32_t)(now - changed_at) >= DOOR_IR_DEBOUNCE_MS)
+        stable_raw = raw;
+
+    door_ir_debug = (stable_raw == DOOR_IR_ACTIVE) ? 1U : 0U;
+
+    if (!door_open) return;
+
+    if (door_ir_debug) {
+        door_pass_detected = 1U;
+        door_clear_counting = 0U; /* person still present -> stay open */
+        return;
+    }
+
+    /* Do not auto-close until at least one real sensor detection occurred. */
+    if (!door_pass_detected) return;
+
+    if (!door_clear_counting) {
+        door_clear_counting = 1U;
+        door_clear_since = now;
+        return;
+    }
+
+    if ((uint32_t)(now - door_clear_since) >= DOOR_IR_CLEAR_MS) {
+        door_open = 0U;
+        door_clear_counting = 0U;
+        door_pass_detected = 0U;
+        Servo_SetAngle(&htim1, TIM_CHANNEL_1, DOOR_CLOSE_ANGLE);
+        door_next_entry = !door_next_entry;
+        door_completed_debug++;
+        LCD_Notify(NOTICE_DOOR_CLOSE, now);
+    }
 }
 
 void SystemClock_Config(void)
@@ -208,6 +594,9 @@ void SystemClock_Config(void)
     clk.APB1CLKDivider = RCC_HCLK_DIV2;
     clk.APB2CLKDivider = RCC_HCLK_DIV1;
     if (HAL_RCC_ClockConfig(&clk, FLASH_LATENCY_2) != HAL_OK) Error_Handler();
+
+    /* ADC1 <= 14 MHz: 72 / 6 = 12 MHz. */
+    __HAL_RCC_ADC_CONFIG(RCC_ADCPCLK2_DIV6);
 }
 
 static HAL_StatusTypeDef RTC_HSE128_Init(void)
@@ -216,7 +605,6 @@ static HAL_StatusTypeDef RTC_HSE128_Init(void)
     __HAL_RCC_PWR_CLK_ENABLE();
     __HAL_RCC_BKP_CLK_ENABLE();
     HAL_PWR_EnableBkUpAccess();
-
     if ((RCC->BDCR & RCC_BDCR_RTCSEL) != RCC_RTCCLKSOURCE_HSE_DIV128) {
         __HAL_RCC_BACKUPRESET_FORCE();
         __HAL_RCC_BACKUPRESET_RELEASE();
@@ -225,28 +613,22 @@ static HAL_StatusTypeDef RTC_HSE128_Init(void)
     __HAL_RCC_RTC_CONFIG(RCC_RTCCLKSOURCE_HSE_DIV128);
     __HAL_RCC_RTC_ENABLE();
     HAL_PWR_EnableBkUpAccess();
-
     CLEAR_BIT(RTC->CRL, RTC_CRL_RSF);
     start = HAL_GetTick();
-    while ((RTC->CRL & RTC_CRL_RSF) == 0U) {
+    while ((RTC->CRL & RTC_CRL_RSF) == 0U)
         if ((uint32_t)(HAL_GetTick() - start) > 2000U) return HAL_TIMEOUT;
-    }
     start = HAL_GetTick();
-    while ((RTC->CRL & RTC_CRL_RTOFF) == 0U) {
+    while ((RTC->CRL & RTC_CRL_RTOFF) == 0U)
         if ((uint32_t)(HAL_GetTick() - start) > 2000U) return HAL_TIMEOUT;
-    }
-
     prl = ((uint32_t)(RTC->PRLH & 0x0FU) << 16) | RTC->PRLL;
     if (prl != 62499U) {
         SET_BIT(RTC->CRL, RTC_CRL_CNF);
         RTC->PRLH = 0U;
         RTC->PRLL = 62499U;
         CLEAR_BIT(RTC->CRL, RTC_CRL_CNF);
-
         start = HAL_GetTick();
-        while ((RTC->CRL & RTC_CRL_RTOFF) == 0U) {
+        while ((RTC->CRL & RTC_CRL_RTOFF) == 0U)
             if ((uint32_t)(HAL_GetTick() - start) > 2000U) return HAL_TIMEOUT;
-        }
     }
     return HAL_OK;
 }
@@ -256,34 +638,67 @@ static void MX_GPIO_Init(void)
     GPIO_InitTypeDef p = {0};
     __HAL_RCC_GPIOA_CLK_ENABLE();
     __HAL_RCC_GPIOB_CLK_ENABLE();
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+    __HAL_RCC_AFIO_CLK_ENABLE();
 
-    /* PA12 button, active LOW */
-    p.Pin = BUTTON_PIN;
-    p.Mode = GPIO_MODE_INPUT;
-    p.Pull = GPIO_PULLUP;
-    HAL_GPIO_Init(BUTTON_PORT, &p);
-
-    /* PA10 DHT11: its driver may switch pin direction while reading */
-    p.Pin = GPIO_PIN_10;
-    p.Mode = GPIO_MODE_INPUT;
-    p.Pull = GPIO_PULLUP;
+    /* PA12 LCD button, PA3 MH infrared sensor digital OUT. */
+    p.Pin = BUTTON_PIN | DOOR_IR_PIN;
+    p.Mode = GPIO_MODE_INPUT; p.Pull = GPIO_PULLUP;
     HAL_GPIO_Init(GPIOA, &p);
 
-    /* PB11 L9110S IB: fixed LOW */
+    p.Pin = GPIO_PIN_10; p.Mode = GPIO_MODE_INPUT; p.Pull = GPIO_PULLUP;
+    HAL_GPIO_Init(GPIOA, &p); /* DHT11 */
+
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_11, GPIO_PIN_RESET);
-    p.Pin = GPIO_PIN_11;
+    p.Pin = GPIO_PIN_11; p.Mode = GPIO_MODE_OUTPUT_PP;
+    p.Pull = GPIO_NOPULL; p.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOB, &p); /* L9110S IB */
+
+    HAL_GPIO_WritePin(LAMP_PORT, LAMP_PIN, GPIO_PIN_RESET);
+    p.Pin = LAMP_PIN; p.Mode = GPIO_MODE_OUTPUT_PP;
+    p.Pull = GPIO_NOPULL; p.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(LAMP_PORT, &p);
+
+    /* MFRC522 CS HIGH idle, RST HIGH released. */
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
+    p.Pin = GPIO_PIN_4; p.Mode = GPIO_MODE_OUTPUT_PP;
+    p.Pull = GPIO_NOPULL; p.Speed = GPIO_SPEED_FREQ_HIGH;
+    HAL_GPIO_Init(GPIOA, &p);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET);
+    p.Pin = GPIO_PIN_0; p.Mode = GPIO_MODE_OUTPUT_PP;
+    p.Pull = GPIO_NOPULL; p.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOB, &p);
+
+    /* Gas outputs from team project. Verify active HIGH/LOW levels
+     * against gas_app.c and connected relay/buzzer hardware. */
+    HAL_GPIO_WritePin(GPIOB,
+        GPIO_PIN_5 | GPIO_PIN_7 | GPIO_PIN_12 |
+        GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15,
+        GPIO_PIN_RESET);
+    p.Pin = GPIO_PIN_5 | GPIO_PIN_7 | GPIO_PIN_12 |
+            GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15;
     p.Mode = GPIO_MODE_OUTPUT_PP;
     p.Pull = GPIO_NOPULL;
     p.Speed = GPIO_SPEED_FREQ_LOW;
     HAL_GPIO_Init(GPIOB, &p);
 
-    /* PA11 lamp */
-    HAL_GPIO_WritePin(LAMP_PORT, LAMP_PIN, GPIO_PIN_RESET);
-    p.Pin = LAMP_PIN;
-    p.Mode = GPIO_MODE_OUTPUT_PP;
+    /* Gas: PB1 = ADC1_IN9. PB6 belongs to TIM4_CH1. */
+    p.Pin = GPIO_PIN_1;
+    p.Mode = GPIO_MODE_ANALOG;
     p.Pull = GPIO_NOPULL;
-    p.Speed = GPIO_SPEED_FREQ_LOW;
-    HAL_GPIO_Init(LAMP_PORT, &p);
+    HAL_GPIO_Init(GPIOB, &p);
+
+    /* Gas external interrupts on PC13 and PC14. */
+    p.Pin = GPIO_PIN_13;
+    p.Mode = GPIO_MODE_IT_RISING;
+    p.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOC, &p);
+    p.Pin = GPIO_PIN_14;
+    p.Mode = GPIO_MODE_IT_FALLING;
+    p.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOC, &p);
+    HAL_NVIC_SetPriority(EXTI15_10_IRQn, 2, 0);
+    HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
 }
 
 static void MX_I2C1_Init(void)
@@ -292,13 +707,10 @@ static void MX_I2C1_Init(void)
     __HAL_RCC_GPIOB_CLK_ENABLE();
     __HAL_RCC_AFIO_CLK_ENABLE();
     __HAL_RCC_I2C1_CLK_ENABLE();
-
     __HAL_AFIO_REMAP_I2C1_ENABLE();
     p.Pin = GPIO_PIN_8 | GPIO_PIN_9;
-    p.Mode = GPIO_MODE_AF_OD;
-    p.Speed = GPIO_SPEED_FREQ_HIGH;
+    p.Mode = GPIO_MODE_AF_OD; p.Speed = GPIO_SPEED_FREQ_HIGH;
     HAL_GPIO_Init(GPIOB, &p);
-
     hi2c1.Instance = I2C1;
     hi2c1.Init.ClockSpeed = 100000U;
     hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
@@ -311,35 +723,104 @@ static void MX_I2C1_Init(void)
     if (HAL_I2C_Init(&hi2c1) != HAL_OK) Error_Handler();
 }
 
+static void MX_SPI1_Init(void)
+{
+    GPIO_InitTypeDef p = {0};
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_AFIO_CLK_ENABLE();
+    __HAL_RCC_SPI1_CLK_ENABLE();
+    __HAL_AFIO_REMAP_SPI1_DISABLE();
+    /* SPI1 SCK PA5 and MOSI PA7: alternate push-pull. */
+    p.Pin = GPIO_PIN_5 | GPIO_PIN_7;
+    p.Mode = GPIO_MODE_AF_PP; p.Speed = GPIO_SPEED_FREQ_HIGH;
+    HAL_GPIO_Init(GPIOA, &p);
+    /* SPI1 MISO PA6: input floating. */
+    p.Pin = GPIO_PIN_6; p.Mode = GPIO_MODE_INPUT;
+    p.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOA, &p);
+
+    hspi1.Instance = SPI1;
+    hspi1.Init.Mode = SPI_MODE_MASTER;
+    hspi1.Init.Direction = SPI_DIRECTION_2LINES;
+    hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+    hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
+    hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
+    hspi1.Init.NSS = SPI_NSS_SOFT;
+    hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16; /* 4.5 MHz */
+    hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+    hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+    hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+    hspi1.Init.CRCPolynomial = 7U;
+    if (HAL_SPI_Init(&hspi1) != HAL_OK) Error_Handler();
+}
+
+static void MX_ADC1_Init(void)
+{
+    ADC_ChannelConfTypeDef s = {0};
+    GPIO_InitTypeDef p = {0};
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_ADC1_CLK_ENABLE();
+    p.Pin = GPIO_PIN_1; p.Mode = GPIO_MODE_ANALOG;
+    HAL_GPIO_Init(GPIOA, &p);
+    /* Also enable gas ADC input PB1. */
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    HAL_GPIO_Init(GPIOB, &p);
+    hadc1.Instance = ADC1;
+    hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
+    hadc1.Init.ContinuousConvMode = DISABLE;
+    hadc1.Init.DiscontinuousConvMode = DISABLE;
+    hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+    hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+    hadc1.Init.NbrOfConversion = 1U;
+    if (HAL_ADC_Init(&hadc1) != HAL_OK) Error_Handler();
+    /* Default ADC channel is gas PB1. Rain_Task selects PA1 then restores PB1. */
+    s.Channel = ADC_CHANNEL_9; s.Rank = ADC_REGULAR_RANK_1;
+    s.SamplingTime = ADC_SAMPLETIME_239CYCLES_5;
+    if (HAL_ADC_ConfigChannel(&hadc1, &s) != HAL_OK) Error_Handler();
+}
+
+static void PWM_1us_Init(TIM_HandleTypeDef *tim, TIM_TypeDef *instance,
+                         uint32_t channel)
+{
+    TIM_OC_InitTypeDef oc = {0};
+    tim->Instance = instance;
+    tim->Init.Prescaler = 71U;
+    tim->Init.CounterMode = TIM_COUNTERMODE_UP;
+    tim->Init.Period = 19999U; /* 50 Hz */
+    tim->Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+    tim->Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+    if (HAL_TIM_PWM_Init(tim) != HAL_OK) Error_Handler();
+    oc.OCMode = TIM_OCMODE_PWM1;
+    oc.Pulse = SERVO_MIN_US;
+    oc.OCPolarity = TIM_OCPOLARITY_HIGH;
+    oc.OCFastMode = TIM_OCFAST_DISABLE;
+    if (HAL_TIM_PWM_ConfigChannel(tim, &oc, channel) != HAL_OK) Error_Handler();
+}
+
+static void MX_TIM1_Init(void)
+{
+    GPIO_InitTypeDef p = {0};
+    __HAL_RCC_TIM1_CLK_ENABLE();
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_AFIO_CLK_ENABLE();
+    /* TIM1 default map CH1 = PA8, servo door */
+    p.Pin = GPIO_PIN_8; p.Mode = GPIO_MODE_AF_PP;
+    p.Speed = GPIO_SPEED_FREQ_HIGH;
+    HAL_GPIO_Init(GPIOA, &p);
+    PWM_1us_Init(&htim1, TIM1, TIM_CHANNEL_1);
+}
+
 static void MX_TIM2_Init(void)
 {
     GPIO_InitTypeDef p = {0};
-    TIM_OC_InitTypeDef oc = {0};
     __HAL_RCC_TIM2_CLK_ENABLE();
-    __HAL_RCC_GPIOB_CLK_ENABLE();
+    __HAL_RCC_GPIOA_CLK_ENABLE();
     __HAL_RCC_AFIO_CLK_ENABLE();
-
-    /* TIM2_CH3 -> PB10 */
-    __HAL_AFIO_REMAP_TIM2_PARTIAL_2();
-    p.Pin = GPIO_PIN_10;
-    p.Mode = GPIO_MODE_AF_PP;
+    __HAL_AFIO_REMAP_TIM2_DISABLE(); /* CH1 = PA0 */
+    p.Pin = GPIO_PIN_0; p.Mode = GPIO_MODE_AF_PP;
     p.Speed = GPIO_SPEED_FREQ_HIGH;
-    HAL_GPIO_Init(GPIOB, &p);
-
-    htim2.Instance = TIM2;
-    htim2.Init.Prescaler = 71U;
-    htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-    htim2.Init.Period = 999U;
-    htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-    htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-    if (HAL_TIM_PWM_Init(&htim2) != HAL_OK) Error_Handler();
-
-    oc.OCMode = TIM_OCMODE_PWM1;
-    oc.Pulse = 0U;
-    oc.OCPolarity = TIM_OCPOLARITY_HIGH;
-    oc.OCFastMode = TIM_OCFAST_DISABLE;
-    if (HAL_TIM_PWM_ConfigChannel(&htim2, &oc, TIM_CHANNEL_3) != HAL_OK)
-        Error_Handler();
+    HAL_GPIO_Init(GPIOA, &p);
+    PWM_1us_Init(&htim2, TIM2, TIM_CHANNEL_1);
 }
 
 static void MX_TIM3_Init(void)
@@ -349,30 +830,58 @@ static void MX_TIM3_Init(void)
     __HAL_RCC_TIM3_CLK_ENABLE();
     __HAL_RCC_GPIOB_CLK_ENABLE();
     __HAL_RCC_AFIO_CLK_ENABLE();
-
-    /* Release PB4 from JTAG, retain SWD; TIM3 CH1 -> PB4 */
-    __HAL_AFIO_REMAP_SWJ_NOJTAG();
-    __HAL_AFIO_REMAP_TIM3_PARTIAL();
-    p.Pin = GPIO_PIN_4;
-    p.Mode = GPIO_MODE_AF_PP;
+    __HAL_AFIO_REMAP_SWJ_NOJTAG(); /* Release PB4, keep SWD */
+    __HAL_AFIO_REMAP_TIM3_PARTIAL(); /* TIM3_CH1 = PB4 */
+    p.Pin = GPIO_PIN_4; p.Mode = GPIO_MODE_AF_PP;
     p.Speed = GPIO_SPEED_FREQ_HIGH;
     HAL_GPIO_Init(GPIOB, &p);
-
     htim3.Instance = TIM3;
     htim3.Init.Prescaler = 71U;
     htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
-    htim3.Init.Period = 999U;
+    htim3.Init.Period = 999U; /* 1 kHz fan PWM */
     htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
     htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
     if (HAL_TIM_PWM_Init(&htim3) != HAL_OK) Error_Handler();
-
     oc.OCMode = TIM_OCMODE_PWM1;
     oc.Pulse = 0U;
     oc.OCPolarity = TIM_OCPOLARITY_HIGH;
     oc.OCFastMode = TIM_OCFAST_DISABLE;
     if (HAL_TIM_PWM_ConfigChannel(&htim3, &oc, TIM_CHANNEL_1) != HAL_OK)
         Error_Handler();
-    /* TIM3 reserved for another module: do NOT start PWM here. */
+    /* fan.c starts TIM3_CH1. */
+}
+
+static void MX_TIM4_Init(void)
+{
+    GPIO_InitTypeDef p = {0};
+    TIM_OC_InitTypeDef oc = {0};
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    __HAL_RCC_AFIO_CLK_ENABLE();
+    __HAL_RCC_TIM4_CLK_ENABLE();
+    __HAL_AFIO_REMAP_TIM4_DISABLE(); /* TIM4_CH1 -> PB6 */
+
+    p.Pin = GPIO_PIN_6;
+    p.Mode = GPIO_MODE_AF_PP;
+    p.Pull = GPIO_NOPULL;
+    p.Speed = GPIO_SPEED_FREQ_HIGH;
+    HAL_GPIO_Init(GPIOB, &p);
+
+    htim4.Instance = TIM4;
+    htim4.Init.Prescaler = 71U;
+    htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
+    htim4.Init.Period = 999U;
+    htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+    htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+    if (HAL_TIM_PWM_Init(&htim4) != HAL_OK) Error_Handler();
+
+    oc.OCMode = TIM_OCMODE_PWM1;
+    oc.Pulse = 0U;
+    oc.OCPolarity = TIM_OCPOLARITY_HIGH;
+    oc.OCFastMode = TIM_OCFAST_DISABLE;
+    if (HAL_TIM_PWM_ConfigChannel(&htim4, &oc, TIM_CHANNEL_1) != HAL_OK)
+        Error_Handler();
+    /* GasApp_Init() should start TIM4_CH1 if its implementation expects it.
+       The original team main does not explicitly start TIM4 PWM. */
 }
 
 void Error_Handler(void)
